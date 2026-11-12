@@ -48,11 +48,26 @@ export function encodeWav(samples: Float32Array): Blob {
 
 /** Slice mono samples into 2-minute WAV blobs with their start offsets. */
 export function sliceIntoChunks(samples: Float32Array): { blob: Blob; startSec: number }[] {
+  return sliceRangeIntoChunks(samples, 0, samples.length / SAMPLE_RATE);
+}
+
+/**
+ * Slice only [startSec, endSec) of the mono samples into 2-minute WAV blobs.
+ * Chunk startSec values are ABSOLUTE (original video time), so transcripts
+ * stitched from them point at the right moments of the original video.
+ */
+export function sliceRangeIntoChunks(
+  samples: Float32Array,
+  startSec: number,
+  endSec: number,
+): { blob: Blob; startSec: number }[] {
   const per = CHUNK_SECONDS * SAMPLE_RATE;
+  const a = Math.max(0, Math.floor(startSec * SAMPLE_RATE));
+  const b = Math.min(samples.length, Math.floor(endSec * SAMPLE_RATE));
   const chunks: { blob: Blob; startSec: number }[] = [];
-  for (let i = 0; i < samples.length; i += per) {
-    const slice = samples.slice(i, Math.min(samples.length, i + per));
-    chunks.push({ blob: encodeWav(slice), startSec: (i / SAMPLE_RATE) });
+  for (let i = a; i < b; i += per) {
+    const slice = samples.slice(i, Math.min(b, i + per));
+    chunks.push({ blob: encodeWav(slice), startSec: i / SAMPLE_RATE });
   }
   return chunks;
 }

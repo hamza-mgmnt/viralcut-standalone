@@ -90,6 +90,9 @@ export type Job = {
   createdAt: string;
   segments: Segment[];
   clips: Clip[];
+  /** When set, this job was generated from one trimmed part only (original-video seconds). */
+  rangeStartSec?: number;
+  rangeEndSec?: number;
 };
 
 export const CAPTION_STYLE_NAMES: Record<CaptionStyleId, string> = {

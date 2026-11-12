@@ -100,9 +100,14 @@ export async function scanSpeakerTrack(
   video: HTMLVideoElement,
   segments: Segment[],
   onProgress?: (p: number) => void,
+  range?: { start: number; end: number },
 ): Promise<SpeakerTurn[]> {
   const duration = video.duration || 0;
   if (!duration || segments.length === 0) return [];
+  const lo = range ? Math.max(0, range.start) : 0;
+  const hi = range ? Math.min(duration, range.end) : duration;
+  const span = hi - lo;
+  if (span <= 0) return [];
   const canvas = document.createElement("canvas");
   canvas.width = 64;
   canvas.height = 36;
@@ -114,9 +119,9 @@ export async function scanSpeakerTrack(
     : null;
 
   const samples: Sample[] = [];
-  const n = Math.floor(duration / SAMPLE_STEP);
+  const n = Math.floor(span / SAMPLE_STEP);
   for (let i = 0; i <= n; i++) {
-    const t = Math.min(duration - 0.05, i * SAMPLE_STEP);
+    const t = Math.min(hi - 0.05, lo + i * SAMPLE_STEP);
     video.currentTime = t;
     await new Promise<void>((resolve) => {
       const onSeek = () => {

@@ -36,6 +36,15 @@ tier and opened from a public link.
   transcript with the spoken word highlighted. Captions on/off toggle in
   Settings and per clip; off means no captions in preview or burned into
   exports; on by default; style choice remembered.
+- **Trimmer**: after uploading, "Trim — use only part of the video" lets you
+  pick one part (sliders, time boxes like 20:00, "set at playhead", Play this
+  part, and First 10 minutes / Next 10-minute part / Whole video quick
+  picks). Generate then transcribes, scans and analyses only that part, and
+  clips, captions and scores keep the ORIGINAL video's times, so a 50-minute
+  video can be worked through 10 minutes at a time. Saved jobs show which
+  part they came from (e.g. "part 20:00–30:00"). Note: the browser still
+  decodes the whole file's audio once; only the chosen part is sent to Groq,
+  scanned for speakers, and sent to the AI Brain.
 - Clip editor (reframe override, caption style), clip thumbnails, 9:16 / 1:1 /
   16:9 framing, export via canvas + MediaRecorder (WebM). Jobs and
   transcripts are stored in browser localStorage (no database server).
@@ -107,7 +116,8 @@ curl -X POST http://localhost:3000/api/transcribe-chunk -F file=@chunk.wav
 - `app/page.tsx` — the whole studio: upload, settings, preview, clips, editor.
 - `app/api/transcribe-chunk/route.ts` — one Groq Whisper chunk per call.
 - `app/api/brain/route.ts` — one Gemini analysis per call, model fallback.
-- `lib/audio.ts` — 16 kHz mono decode + 2-minute WAV chunking.
+- `lib/audio.ts` — 16 kHz mono decode + 2-minute WAV chunking (whole file or one trimmed range).
+- `lib/trim.ts` — trimmer time parsing, part clamping, next-part and job labels.
 - `lib/clips.ts` — transcript-grounded clip picks, titles, scores.
 - `lib/speaker.ts` — shot-aware scan, per-turn decisions, focus glide.
 - `lib/captions.ts` — 12 caption styles (CSS preview + canvas export).

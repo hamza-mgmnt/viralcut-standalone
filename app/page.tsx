@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { decodeAudioToMono16k, rmsEnergy, sliceIntoChunks } from "../lib/audio";
+import { decodeAudioToMono16k, rmsEnergy, sliceRangeIntoChunks } from "../lib/audio";
 import { runBrain, sampleFrames } from "../lib/brain";
 import { CAPTION_STYLES } from "../lib/captions";
 import { buildClips, wordTimings } from "../lib/clips";
@@ -13,6 +13,14 @@ import {
   objectPosPct,
   scanSpeakerTrack,
 } from "../lib/speaker";
+import {
+  clampPart,
+  DEFAULT_PART_SECONDS,
+  formatTimecode,
+  nextPart,
+  parseTimecode,
+  partLabel,
+} from "../lib/trim";
 import type {
   BrainResult,
   BrainStatus,
@@ -87,6 +95,13 @@ export default function Home() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [mono, setMono] = useState<Float32Array | null>(null);
+  // Trimmer: generate clips from one part of a long video only.
+  const [trimEnabled, setTrimEnabled] = useState(false);
+  const [trimStart, setTrimStart] = useState(0);
+  const [trimEnd, setTrimEnd] = useState(DEFAULT_PART_SECONDS);
+  const [startText, setStartText] = useState("0:00");
+  const [endText, setEndText] = useState("10:00");
+  const previewEndRef = useRef<number | null>(null);
 
   useEffect(() => {
     setJobs(loadJobs());
@@ -103,6 +118,38 @@ export default function Home() {
   const selected = useMemo(() => clips.find((c) => c.id === selectedId) ?? clips[0], [clips, selectedId]);
   const aspectSize = aspect === "9:16" ? "aspect-[9/16]" : aspect === "1:1" ? "aspect-square" : "aspect-video";
 
+  // The part Generate will actually process, clamped to the real duration.
+  const effectivePart = useMemo(
+    () => (trimEnabled && duration > 0 ? clampPart(trimStart, trimEnd, duration) : { start: 0, end: duration }),
+    [trimEnabled, trimStart, trimEnd, duration],
+  );
+
+  const setPart = useCallback(
+    (start: number, end: number) => {
+      const part = duration > 0 ? clampPart(start, end, duration) : { start, end };
+      setTrimStart(part.start);
+      setTrimEnd(part.end);
+      setStartText(formatTimecode(part.start));
+      setEndText(formatTimecode(part.end));
+    },
+    [duration],
+  );
+
+  const commitTimeText = useCallback(
+    (which: "start" | "end") => {
+      const parsed = parseTimecode(which === "start" ? startText : endText);
+      if (parsed == null) {
+        // Invalid input: snap the box back to the current value.
+        if (which === "start") setStartText(formatTimecode(trimStart));
+        else setEndText(formatTimecode(trimEnd));
+        return;
+      }
+      if (which === "start") setPart(parsed, trimEnd);
+      else setPart(trimStart, parsed);
+    },
+    [startText, endText, trimStart, trimEnd, setPart],
+  );
+
   const onFile = useCallback((f: File | undefined) => {
     if (!f) return;
     if (!/\.mp4$/i.test(f.name) && f.type !== "video/mp4") {
@@ -117,6 +164,12 @@ export default function Home() {
     setBrainResult(null);
     setBrainStatus("idle");
     setPhase("idle");
+    setTrimEnabled(false);
+    setTrimStart(0);
+    setTrimEnd(DEFAULT_PART_SECONDS);
+    setStartText("0:00");
+    setEndText("10:00");
+    setDuration(0);
     const url = URL.createObjectURL(f);
     setVideoUrl(url);
   }, []);
@@ -128,9 +181,15 @@ export default function Home() {
     setPhase("decoding");
     setProgress("Reading audio…");
     try {
+      // Trim: only the chosen part is transcribed, scanned and analysed.
+      // Chunk offsets stay in ORIGINAL video time, so clips/captions/scores
+      // point at the right moments of the full video.
+      const fullDuration = video.duration || duration || 0;
+      const part = trimEnabled ? clampPart(trimStart, trimEnd, fullDuration) : { start: 0, end: fullDuration };
       const samples = await decodeAudioToMono16k(file);
       setMono(samples);
-      const chunks = sliceIntoChunks(samples);
+      const chunks = sliceRangeIntoChunks(samples, part.start, part.end);
+      if (chunks.length === 0) throw new Error("That trimmed part has no audio to transcribe.");
       const all: Segment[] = [];
       setPhase("transcribing");
       for (let i = 0; i < chunks.length; i++) {
@@ -151,8 +210,11 @@ export default function Home() {
       // Shot-aware speaker scan (built-in fallback track).
       setPhase("scanning");
       setProgress("Scanning speakers…");
-      const scan = await scanSpeakerTrack(video, all, (p) =>
-        setProgress(`Scanning speakers… ${Math.round(p * 100)}%`),
+      const scan = await scanSpeakerTrack(
+        video,
+        all,
+        (p) => setProgress(`Scanning speakers… ${Math.round(p * 100)}%`),
+        trimEnabled ? part : undefined,
       );
       let finalTurns = scan;
       setTurns(scan);
@@ -161,7 +223,7 @@ export default function Home() {
       setPhase("brain");
       setBrainStatus("working");
       setProgress("AI Brain is watching the video…");
-      const frames = await sampleFrames(video, 2, 48);
+      const frames = await sampleFrames(video, 2, 48, trimEnabled ? part : undefined);
       const brain = await runBrain(frames, all, video.duration, (s, model, err) => {
         setBrainStatus(s);
         if (model) setBrainModel(model);
@@ -221,6 +283,8 @@ export default function Home() {
         createdAt: new Date().toISOString(),
         segments: corrected,
         clips: made,
+        rangeStartSec: part.start,
+        rangeEndSec: part.end,
       };
       const next = [job, ...loadJobs()].slice(0, 10);
       try {
@@ -236,7 +300,7 @@ export default function Home() {
       setError(e instanceof Error ? e.message : "Generate failed.");
       setProgress("");
     }
-  }, [file]);
+  }, [file, trimEnabled, trimStart, trimEnd, duration]);
 
   const currentTurn = useMemo(() => {
     if (!turns.length) return null;
@@ -383,6 +447,141 @@ export default function Home() {
         </p>
       </section>
 
+      {/* Trimmer — use only part of the video */}
+      {file && (
+        <section className="bg-panel border border-white/10 rounded-2xl p-4 mb-6">
+          <label className="flex items-center gap-2 font-bold">
+            <input
+              type="checkbox"
+              checked={trimEnabled}
+              onChange={(e) => {
+                const on = e.target.checked;
+                setTrimEnabled(on);
+                if (on) setPart(0, DEFAULT_PART_SECONDS);
+              }}
+              className="w-5 h-5 accent-orange-500"
+            />
+            Trim — use only part of the video
+          </label>
+          {trimEnabled && (
+            <div className="mt-3">
+              <p className="text-sm text-white/70 mb-3">
+                Only this part is transcribed and clipped:{" "}
+                <span className="text-white font-bold">
+                  {formatTimecode(effectivePart.start)} – {formatTimecode(effectivePart.end)}
+                </span>{" "}
+                of {formatTimecode(duration)}. Clips keep the original video&apos;s times.
+              </p>
+              <div className="grid sm:grid-cols-2 gap-4">
+                <div>
+                  <p className="text-sm text-white/70 mb-1">Start</p>
+                  <input
+                    type="range"
+                    min={0}
+                    max={Math.max(1, Math.floor(duration))}
+                    step={1}
+                    value={Math.floor(effectivePart.start)}
+                    onChange={(e) => setPart(parseFloat(e.target.value), trimEnd)}
+                    className="w-full"
+                  />
+                  <div className="flex gap-2 mt-1">
+                    <input
+                      type="text"
+                      value={startText}
+                      onChange={(e) => setStartText(e.target.value)}
+                      onBlur={() => commitTimeText("start")}
+                      onKeyDown={(e) => e.key === "Enter" && commitTimeText("start")}
+                      className="w-24 bg-black/40 border border-white/20 rounded-lg px-2 py-1 text-sm font-mono"
+                      aria-label="Trim start time"
+                    />
+                    <button
+                      onClick={() => {
+                        const v = videoRef.current;
+                        if (v) setPart(v.currentTime, trimEnd);
+                      }}
+                      className="px-3 py-1 rounded-full text-xs border border-white/20"
+                    >
+                      Set at playhead
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <p className="text-sm text-white/70 mb-1">End</p>
+                  <input
+                    type="range"
+                    min={0}
+                    max={Math.max(1, Math.floor(duration))}
+                    step={1}
+                    value={Math.floor(effectivePart.end)}
+                    onChange={(e) => setPart(trimStart, parseFloat(e.target.value))}
+                    className="w-full"
+                  />
+                  <div className="flex gap-2 mt-1">
+                    <input
+                      type="text"
+                      value={endText}
+                      onChange={(e) => setEndText(e.target.value)}
+                      onBlur={() => commitTimeText("end")}
+                      onKeyDown={(e) => e.key === "Enter" && commitTimeText("end")}
+                      className="w-24 bg-black/40 border border-white/20 rounded-lg px-2 py-1 text-sm font-mono"
+                      aria-label="Trim end time"
+                    />
+                    <button
+                      onClick={() => {
+                        const v = videoRef.current;
+                        if (v) setPart(trimStart, v.currentTime);
+                      }}
+                      className="px-3 py-1 rounded-full text-xs border border-white/20"
+                    >
+                      Set at playhead
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2 mt-4">
+                <button
+                  onClick={() => setPart(0, DEFAULT_PART_SECONDS)}
+                  className="px-3 py-1 rounded-full text-xs border border-white/20"
+                >
+                  First 10 minutes
+                </button>
+                <button
+                  onClick={() => {
+                    const next = nextPart(effectivePart, duration);
+                    setPart(next.start, next.end);
+                  }}
+                  className="px-3 py-1 rounded-full text-xs border border-white/20"
+                >
+                  Next 10-minute part
+                </button>
+                <button
+                  onClick={() => setPart(0, duration)}
+                  className="px-3 py-1 rounded-full text-xs border border-white/20"
+                >
+                  Whole video
+                </button>
+                <button
+                  onClick={() => {
+                    const v = videoRef.current;
+                    if (!v) return;
+                    previewEndRef.current = effectivePart.end;
+                    v.currentTime = effectivePart.start;
+                    v.play().catch(() => undefined);
+                  }}
+                  className="px-3 py-1 rounded-full text-xs bg-accent border border-accent font-bold"
+                >
+                  Play this part
+                </button>
+              </div>
+              <p className="text-xs text-white/50 mt-3">
+                Work through a long video 10 minutes at a time: generate one part, then pick the next
+                part and generate again. Type times like 20:00 in the boxes.
+              </p>
+            </div>
+          )}
+        </section>
+      )}
+
       {/* Settings */}
       <section className="bg-panel border border-white/10 rounded-2xl p-4 mb-6">
         <h2 className="font-bold mb-3">Settings</h2>
@@ -486,7 +685,14 @@ export default function Home() {
                   objectPosition: `${objectPosPct(focus, cropFrac)}% 50%`,
                 }}
                 onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
-                onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+                onTimeUpdate={(e) => {
+                  const t = e.currentTarget.currentTime;
+                  setCurrentTime(t);
+                  if (previewEndRef.current != null && t >= previewEndRef.current) {
+                    previewEndRef.current = null;
+                    e.currentTarget.pause();
+                  }
+                }}
               />
             ) : (
               <div className="absolute inset-0 flex items-center justify-center text-white/40 text-sm px-6 text-center">
@@ -643,7 +849,14 @@ export default function Home() {
                     }}
                     className="w-full text-left bg-panel border border-white/10 rounded-xl px-4 py-2 text-sm"
                   >
-                    {j.fileName} · {j.clips.length} clips · {new Date(j.createdAt).toLocaleString()}
+                    {j.fileName} · {j.clips.length} clips ·{" "}
+                    {partLabel(
+                      j.rangeStartSec != null
+                        ? { start: j.rangeStartSec, end: j.rangeEndSec ?? j.durationSec }
+                        : null,
+                      j.durationSec,
+                    )}{" "}
+                    · {new Date(j.createdAt).toLocaleString()}
                   </button>
                 ))}
               </div>

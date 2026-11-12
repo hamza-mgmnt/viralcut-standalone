@@ -7,17 +7,22 @@ export async function sampleFrames(
   video: HTMLVideoElement,
   everySec = 2,
   maxFrames = 48,
+  range?: { start: number; end: number },
 ): Promise<{ t: number; jpeg: string }[]> {
   const duration = video.duration || 0;
+  const lo = range ? Math.max(0, range.start) : 0;
+  const hi = range ? Math.min(duration, range.end) : duration;
+  const span = Math.max(0, hi - lo);
+  if (!span) return [];
   const canvas = document.createElement("canvas");
   canvas.width = 320;
   canvas.height = Math.round((320 * video.videoHeight) / Math.max(1, video.videoWidth));
   const ctx = canvas.getContext("2d");
   if (!ctx) return [];
   const frames: { t: number; jpeg: string }[] = [];
-  const count = Math.min(maxFrames, Math.max(1, Math.floor(duration / everySec)));
+  const count = Math.min(maxFrames, Math.max(1, Math.floor(span / everySec)));
   for (let i = 0; i < count; i++) {
-    const t = Math.min(duration - 0.1, (i * duration) / count);
+    const t = Math.min(hi - 0.1, lo + (i * span) / count);
     video.currentTime = t;
     await new Promise<void>((resolve) => {
       const onSeek = () => {
