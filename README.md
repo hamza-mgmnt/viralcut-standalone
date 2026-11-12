@@ -77,8 +77,10 @@ video time. The UI shows which path produced the audio
    for files whose audio codec Chrome cannot decode at all (e.g. AC-3).
    The single-thread core (`@ffmpeg/core` 0.12.9 — verified to contain no
    SharedArrayBuffer/pthread use, so it needs no COOP/COEP headers) loads
-   from the jsDelivr CDN at runtime via `toBlobURL`, with download
-   progress shown. First use downloads ~30 MB (ffmpeg-core.wasm is
+   from the jsDelivr CDN at runtime via a local download helper (not
+   `@ffmpeg/util`'s `toBlobURL` with progress — its fallback re-reads an
+   already-consumed response body and throws, which broke the fallback
+   in live testing), with download progress shown. First use downloads ~30 MB (ffmpeg-core.wasm is
    32.2 MB); the core then stays loaded for the session. ffmpeg seeks
    before the input (`-ss <start> -t <length> -i …`) so only the part is
    decoded, and outputs 16 kHz mono WAV. No `.wasm` is bundled by Next.js;

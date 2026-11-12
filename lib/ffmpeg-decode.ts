@@ -14,11 +14,16 @@
 //   cross-origin isolation, and is deliberately NOT used.
 // - Core version pinned to 0.12.9: the value of @ffmpeg/ffmpeg 0.12.15's
 //   own CORE_VERSION constant (its built-in default). The core loads from
-//   the jsDelivr CDN at runtime via toBlobURL (with download progress);
-//   no .wasm is bundled by Next.js.
-// - toBlobURL(url, mimeType, progress, cb) reports {received, total} so
-//   the ~30 MB first-use download (ffmpeg-core.wasm is 32.2 MB) can show
-//   real progress.
+//   the jsDelivr CDN at runtime via a local download helper below (with
+//   download progress); no .wasm is bundled by Next.js.
+// - Do NOT use @ffmpeg/util's toBlobURL(url, mime, progress=true): its
+//   downloadWithProgress fallback calls resp.arrayBuffer() AFTER its
+//   reader already consumed the body, which throws "body stream already
+//   disturbed" whenever the streamed byte count disagrees with
+//   Content-Length (jsDelivr serves compressed bodies) — observed live
+//   on 2026-11-12, breaking the whole fallback. The local helper never
+//   re-reads a consumed body and never treats a Content-Length
+//   mismatch as fatal.
 //
 // Limits: the whole file's bytes are loaded into the wasm filesystem
 // (writeFile), so a very large file can still exhaust wasm memory; the
@@ -39,19 +44,74 @@ type FFmpegInstance = import("@ffmpeg/ffmpeg").FFmpeg;
 
 let ffmpegPromise: Promise<FFmpegInstance> | null = null;
 
+/**
+ * Download a URL to a blob URL, reporting (received, total) progress.
+ * Exported for unit testing. Never re-reads a consumed response body:
+ * when a stream reader is used, the bytes come only from the reader;
+ * arrayBuffer() is used only when there is no body stream at all (the
+ * body is then untouched). A Content-Length that disagrees with the
+ * streamed bytes (compressed CDN responses) is reported as-is and is
+ * never treated as a failure.
+ */
+export async function fetchToBlobURL(
+  url: string,
+  mimeType: string,
+  onProgress?: (received: number, total: number) => void,
+): Promise<string> {
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    throw new Error(`download failed (HTTP ${resp.status}) for ${url}`);
+  }
+  const total = parseInt(resp.headers.get("content-length") || "-1", 10);
+  if (!resp.body) {
+    const buf = await resp.arrayBuffer();
+    onProgress?.(buf.byteLength, buf.byteLength);
+    return URL.createObjectURL(new Blob([buf], { type: mimeType }));
+  }
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      received += value.length;
+      onProgress?.(received, total);
+    }
+  }
+  const data = new Uint8Array(received);
+  let position = 0;
+  for (const chunk of chunks) {
+    data.set(chunk, position);
+    position += chunk.length;
+  }
+  onProgress?.(received, total);
+  return URL.createObjectURL(new Blob([data.buffer], { type: mimeType }));
+}
+
 /** Load the single-thread core once per session, with download progress. */
 async function loadFfmpeg(onProgress?: ProgressFn): Promise<FFmpegInstance> {
   if (!ffmpegPromise) {
     ffmpegPromise = (async () => {
       const { FFmpeg } = await import("@ffmpeg/ffmpeg");
-      const { toBlobURL } = await import("@ffmpeg/util");
       const ffmpeg = new FFmpeg();
-      const report = (what: string) => (e: { received: number; total: number }) => {
-        const pct = e.total > 0 ? Math.round((e.received / e.total) * 100) : 0;
-        onProgress?.(`Downloading fallback decoder (${what})… ${pct}%`);
-      };
-      const coreURL = await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript", true, report("core"));
-      const wasmURL = await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm", true, report("decoder"));
+      const report =
+        (what: string) =>
+        (received: number, total: number) => {
+          const pct = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0;
+          onProgress?.(`Downloading fallback decoder (${what})… ${pct}%`);
+        };
+      const coreURL = await fetchToBlobURL(
+        `${CORE_BASE}/ffmpeg-core.js`,
+        "text/javascript",
+        report("core"),
+      );
+      const wasmURL = await fetchToBlobURL(
+        `${CORE_BASE}/ffmpeg-core.wasm`,
+        "application/wasm",
+        report("decoder"),
+      );
       // No workerURL: that option is only for the multithread core.
       await ffmpeg.load({ coreURL, wasmURL });
       if (!ffmpeg.loaded) throw new Error("ffmpeg core reported it did not load");
