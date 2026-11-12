@@ -3,12 +3,24 @@
 
 export const CHUNK_SECONDS = 120;
 export const SAMPLE_RATE = 16000;
+/** Groq rejects audio shorter than 0.01s; never send a trailing sliver. */
+export const MIN_CHUNK_SECONDS = 1;
 
 /** Decode a video file's audio track to 16 kHz mono Float32 samples. */
 export async function decodeAudioToMono16k(file: File): Promise<Float32Array> {
   const ctx = new OfflineAudioContext(1, 1, 44100);
   const buf = await file.arrayBuffer();
-  const decoded = await ctx.decodeAudioData(buf);
+  let decoded: AudioBuffer;
+  try {
+    decoded = await ctx.decodeAudioData(buf);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : "unknown decode error";
+    throw new Error(
+      `Unable to decode this video's audio (${(file.size / 1e6).toFixed(1)} MB). ` +
+        `The browser could not read its audio track — the file may be too large for this browser or use an unsupported audio codec. ` +
+        `Browser error: ${detail}`,
+    );
+  }
   const channel = decoded.getChannelData(0);
   const ratio = decoded.sampleRate / SAMPLE_RATE;
   const outLen = Math.floor(channel.length / ratio);
@@ -64,10 +76,21 @@ export function sliceRangeIntoChunks(
   const per = CHUNK_SECONDS * SAMPLE_RATE;
   const a = Math.max(0, Math.floor(startSec * SAMPLE_RATE));
   const b = Math.min(samples.length, Math.floor(endSec * SAMPLE_RATE));
+  if (b <= a) return [];
+  // Chunk boundaries every 2 minutes. A trailing chunk shorter than
+  // MIN_CHUNK_SECONDS (e.g. a few ms of audio past a boundary) is merged
+  // into the previous chunk instead of being sent alone — Groq rejects
+  // audio shorter than 0.01s, which used to fail the whole Generate.
+  const starts: number[] = [];
+  for (let i = a; i < b; i += per) starts.push(i);
+  if (starts.length > 1 && b - starts[starts.length - 1] < MIN_CHUNK_SECONDS * SAMPLE_RATE) {
+    starts.pop();
+  }
   const chunks: { blob: Blob; startSec: number }[] = [];
-  for (let i = a; i < b; i += per) {
-    const slice = samples.slice(i, Math.min(b, i + per));
-    chunks.push({ blob: encodeWav(slice), startSec: i / SAMPLE_RATE });
+  for (let k = 0; k < starts.length; k++) {
+    const i = starts[k];
+    const j = k + 1 < starts.length ? starts[k + 1] : b;
+    chunks.push({ blob: encodeWav(samples.slice(i, j)), startSec: i / SAMPLE_RATE });
   }
   return chunks;
 }
