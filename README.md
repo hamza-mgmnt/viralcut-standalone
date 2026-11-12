@@ -42,12 +42,63 @@ tier and opened from a public link.
   picks). Generate then transcribes, scans and analyses only that part, and
   clips, captions and scores keep the ORIGINAL video's times, so a 50-minute
   video can be worked through 10 minutes at a time. Saved jobs show which
-  part they came from (e.g. "part 20:00–30:00"). Note: the browser still
-  decodes the whole file's audio once; only the chosen part is sent to Groq,
-  scanned for speakers, and sent to the AI Brain.
+  part they came from (e.g. "part 20:00–30:00"). When Trim is on, only the
+  chosen part's audio is decoded (see "How audio is decoded" below); the
+  full file is never decoded just to throw most of it away.
 - Clip editor (reframe override, caption style), clip thumbnails, 9:16 / 1:1 /
   16:9 framing, export via canvas + MediaRecorder (WebM). Jobs and
   transcripts are stored in browser localStorage (no database server).
+
+## How audio is decoded
+
+Three decode paths, tried in order by `lib/decode.ts`. Every path returns
+the same shape — a full-length 16 kHz mono buffer with silence outside the
+trimmed part — so chunking, scoring and transcripts all keep absolute
+video time. The UI shows which path produced the audio
+("Audio: trimmed range only (streaming)" / "Audio: full decode" /
+"Audio: fallback decoder").
+
+1. **Streaming range decode** (`lib/range-decode.ts`, Trim ON only):
+   mp4box.js + WebCodecs `AudioDecoder`. The file is read in 1 MB slices;
+   mp4box's `appendBuffer` return value jumps straight to the moov box
+   (even when moov is at the end of the file), `seek()` jumps to the part
+   start, and only in-range audio samples are decoded. Feeding stops once
+   sample times pass the part end. On a 65 MB / 50-minute test file, a
+   10-minute part reads ~26% of the file and memory stays bounded
+   (no `keepMdatData`, used samples released per batch). The AAC decoder
+   config is built from the observed track (codec string, sample rate,
+   channel count, esds bytes) and checked with
+   `AudioDecoder.isConfigSupported`. Pure helpers (AAC config, WAV parsing,
+   downmix/resample/placement) live in `lib/pcm.ts` and are unit-tested.
+2. **Full decode** (`lib/audio.ts` `decodeAudioToMono16k`): the browser's
+   `decodeAudioData` on the whole file. This is the first path when Trim
+   is OFF, and the fallback when streaming decode fails.
+3. **ffmpeg.wasm fallback** (`lib/ffmpeg-decode.ts`, last resort only):
+   for files whose audio codec Chrome cannot decode at all (e.g. AC-3).
+   The single-thread core (`@ffmpeg/core` 0.12.9 — verified to contain no
+   SharedArrayBuffer/pthread use, so it needs no COOP/COEP headers) loads
+   from the jsDelivr CDN at runtime via `toBlobURL`, with download
+   progress shown. First use downloads ~30 MB (ffmpeg-core.wasm is
+   32.2 MB); the core then stays loaded for the session. ffmpeg seeks
+   before the input (`-ss <start> -t <length> -i …`) so only the part is
+   decoded, and outputs 16 kHz mono WAV. No `.wasm` is bundled by Next.js;
+   the ffmpeg worker is bundled as its own chunk by webpack.
+
+Limits, stated plainly:
+
+- The ffmpeg path still loads the whole file's bytes into wasm memory
+  (`writeFile`), so an extremely large file can exhaust wasm memory even
+  when only a part is decoded.
+- Browsers without WebCodecs (`AudioDecoder`) skip the streaming path and
+  go straight to full decode, then the ffmpeg fallback.
+- Fragmented MP4s (`isFragmented`) are not supported by the streaming path
+  (untested) — they fall through to full decode / ffmpeg.
+- The streaming path is AAC-first: other codecs are attempted without a
+  description and fall through when the browser reports no supported
+  config. The ffmpeg fallback handles the codecs Chrome cannot.
+- ffmpeg `-ss` output can start a fraction of a second off the exact seek
+  point; AAC priming can shift streaming-decoded audio by a few tens of
+  ms. Neither matters for transcription.
 
 ## Keys
 
@@ -117,6 +168,11 @@ curl -X POST http://localhost:3000/api/transcribe-chunk -F file=@chunk.wav
 - `app/api/transcribe-chunk/route.ts` — one Groq Whisper chunk per call.
 - `app/api/brain/route.ts` — one Gemini analysis per call, model fallback.
 - `lib/audio.ts` — 16 kHz mono decode + 2-minute WAV chunking (whole file or one trimmed range).
+- `lib/decode.ts` — decode fallback chain (streaming range → full → ffmpeg) + method labels.
+- `lib/range-decode.ts` — streaming range decode (mp4box.js + WebCodecs), Trim ON only.
+- `lib/ffmpeg-decode.ts` — ffmpeg.wasm fallback decoder (single-thread core from CDN).
+- `lib/pcm.ts` — pure PCM helpers: AAC config, WAV parsing, downmix/resample/placement.
+- `lib/webcodecs.d.ts` — minimal WebCodecs audio types (TS 5.5's DOM lib lacks them).
 - `lib/trim.ts` — trimmer time parsing, part clamping, next-part and job labels.
 - `lib/clips.ts` — transcript-grounded clip picks, titles, scores.
 - `lib/speaker.ts` — shot-aware scan, per-turn decisions, focus glide.

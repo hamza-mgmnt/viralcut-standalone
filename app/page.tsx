@@ -1,10 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { decodeAudioToMono16k, rmsEnergy, sliceRangeIntoChunks } from "../lib/audio";
+import { rmsEnergy, sliceRangeIntoChunks } from "../lib/audio";
 import { runBrain, sampleFrames } from "../lib/brain";
 import { CAPTION_STYLES } from "../lib/captions";
 import { buildClips, wordTimings } from "../lib/clips";
+import { decodeAudio, DECODE_METHOD_LABELS } from "../lib/decode";
 import { exportClip, type Aspect } from "../lib/exporter";
 import {
   cropWidthFraction,
@@ -78,6 +79,7 @@ export default function Home() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [progress, setProgress] = useState("");
   const [error, setError] = useState("");
+  const [decodeMethod, setDecodeMethod] = useState("");
   const [segments, setSegments] = useState<Segment[]>([]);
   const [clips, setClips] = useState<Clip[]>([]);
   const [selectedId, setSelectedId] = useState<string>("");
@@ -161,6 +163,7 @@ export default function Home() {
     setClips([]);
     setSegments([]);
     setTurns([]);
+    setDecodeMethod("");
     setBrainResult(null);
     setBrainStatus("idle");
     setPhase("idle");
@@ -178,6 +181,7 @@ export default function Home() {
     const video = videoRef.current;
     if (!file || !video) return;
     setError("");
+    setDecodeMethod("");
     setPhase("decoding");
     setProgress("Reading audio…");
     try {
@@ -186,7 +190,17 @@ export default function Home() {
       // point at the right moments of the full video.
       const fullDuration = video.duration || duration || 0;
       const part = trimEnabled ? clampPart(trimStart, trimEnd, fullDuration) : { start: 0, end: fullDuration };
-      const samples = await decodeAudioToMono16k(file);
+      // Decode chain: streaming range decode (trim on) -> full decode ->
+      // ffmpeg fallback. Returns a full-length buffer with silence outside
+      // the part, so everything below keeps absolute video time.
+      const decoded = await decodeAudio(
+        file,
+        fullDuration,
+        trimEnabled ? part : null,
+        (t) => setProgress(t),
+      );
+      const samples = decoded.samples;
+      setDecodeMethod(DECODE_METHOD_LABELS[decoded.method]);
       setMono(samples);
       const chunks = sliceRangeIntoChunks(samples, part.start, part.end);
       if (chunks.length === 0) throw new Error("That trimmed part has no audio to transcribe.");
@@ -666,6 +680,7 @@ export default function Home() {
           {phase === "idle" || phase === "ready" || phase === "error" ? "Generate clips" : progress || "Working…"}
         </button>
         {progress && phase !== "idle" && <p className="mt-2 text-sm text-white/60">{progress}</p>}
+        {decodeMethod && <p className="mt-2 text-xs text-white/60">{decodeMethod}</p>}
       </section>
 
       <div className="grid md:grid-cols-5 gap-6">
